@@ -154,6 +154,11 @@ async def on_lang_chosen(callback):
     await callback.answer()
 
 
+@router.message(F.text == "/chatid")
+async def get_chat_id(message: Message):
+    await message.answer(f"Chat ID: <code>{message.chat.id}</code>")
+
+
 @router.message(F.text.in_(["🌐 Til / Язык"]))
 async def change_lang(message: Message):
     await message.answer("Tilni tanlang / Выберите язык:", reply_markup=lang_keyboard())
