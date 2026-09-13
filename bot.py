@@ -192,16 +192,31 @@ async def on_webapp_order(message: Message):
 
     items = order.get("items", [])
     total = order.get("total", 0)
+    subtotal = order.get("subtotal", 0)
+    delivery = order.get("delivery", 0)
+    cust_name = order.get("name", "").strip()
+    cust_phone = order.get("phone", "").strip() or user.get("phone", "-")
+    cust_address = order.get("address", "").strip()
+    cust_comment = order.get("comment", "").strip()
 
-    lines_uz = [f"🧾 <b>Yangi buyurtma #{message.from_user.id}-{datetime.now().strftime('%H%M%S')}</b>"]
-    lines_uz.append(f"👤 {message.from_user.full_name} (@{message.from_user.username or '-'})")
-    if user.get("phone"):
-        lines_uz.append(f"📞 {user['phone']}")
+    order_no = datetime.now().strftime("%d%m-%H%M%S")
+
+    lines_uz = [f"🧾 <b>YANGI BUYURTMA №{order_no}</b>", ""]
+    lines_uz.append(f"👤 <b>Mijoz:</b> {cust_name or message.from_user.full_name}")
+    lines_uz.append(f"📞 <b>Telefon:</b> {cust_phone}")
+    lines_uz.append(f"📍 <b>Manzil:</b> {cust_address or 'kiritilmagan'}")
+    if cust_comment:
+        lines_uz.append(f"📝 <b>Izoh:</b> {cust_comment}")
     lines_uz.append("")
+    lines_uz.append("🍽 <b>Buyurtma tarkibi:</b>")
     for it in items:
-        lines_uz.append(f"• {it['name']} x{it['qty']} — {it['price'] * it['qty']:,} so'm".replace(",", " "))
+        line_total = it['price'] * it['qty']
+        lines_uz.append(f"  • {it['name']} — {it['qty']} dona × {it['price']:,} so'm = {line_total:,} so'm".replace(",", " "))
     lines_uz.append("")
-    lines_uz.append(f"💰 <b>Jami: {total:,} so'm</b>".replace(",", " "))
+    lines_uz.append(f"Mahsulotlar: {subtotal:,} so'm".replace(",", " "))
+    delivery_text = "BEPUL" if delivery == 0 else f"{delivery:,} so'm".replace(",", " ")
+    lines_uz.append(f"Yetkazib berish: {delivery_text}")
+    lines_uz.append(f"💰 <b>JAMI: {total:,} so'm</b>".replace(",", " "))
 
     order_text = "\n".join(lines_uz)
 
