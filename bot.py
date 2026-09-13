@@ -11,10 +11,11 @@ import logging
 import os
 from datetime import datetime
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, StateFilter
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -30,18 +31,33 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
-from menu_data import MENU, DELIVERY_FEE, FREE_DELIVERY_THRESHOLD, LOYALTY_EVERY_N_ORDER_FREE
+from menu_data import (
+    load_daily_menu,
+    save_daily_menu,
+    add_dish,
+    remove_dish,
+    clear_menu,
+    DELIVERY_FEE,
+    FREE_DELIVERY_THRESHOLD,
+    LOYALTY_EVERY_N_ORDER_FREE,
+)
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://example.com/webapp/")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")  # buyurtmalar shu chatga tushadi
-COMPANY_NAME = os.getenv("COMPANY_NAME", "Lazzatli")
-MANAGER_PHONE = os.getenv("MANAGER_PHONE", "+998 90 000 00 00")
+OWNER_ID = os.getenv("OWNER_ID", "")  # menyuni boshqara oladigan shaxsning Telegram ID'si
+COMPANY_NAME = os.getenv("COMPANY_NAME", "Bereke")
+MANAGER_PHONE = os.getenv("MANAGER_PHONE", "+998 97 356 89 94")
+PORT = int(os.getenv("PORT", "8080"))
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
+
+
+def is_owner(user_id: int) -> bool:
+    return OWNER_ID != "" and str(user_id) == str(OWNER_ID)
 
 
 class OrderForm(StatesGroup):
@@ -49,6 +65,13 @@ class OrderForm(StatesGroup):
     waiting_phone = State()
     waiting_address = State()
     waiting_comment = State()
+
+
+class DishForm(StatesGroup):
+    waiting_name = State()
+    waiting_price = State()
+    waiting_photo = State()
+    waiting_desc = State()
 
 # ------------------------------------------------------------------
 # Juda oddiy "baza" - foydalanuvchi tili va telefon raqamini json faylda saqlaydi.
@@ -366,6 +389,116 @@ async def order_get_comment(message: Message, state: FSMContext):
     await state.clear()
 
 
+@router.message(Command("yordam"))
+async def admin_help(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    text = (
+        "🛠 <b>Admin buyruqlari:</b>\n\n"
+        "/taom_qoshish — bugungi menyuga yangi taom qo'shish\n"
+        "/taom_royxati — hozirgi kunlik menyuni ko'rish\n"
+        "/taom_ochirish — ro'yxatdagi raqami bo'yicha taomni o'chirish\n"
+        "/menu_tozalash — ertangi kun uchun butun menyuni tozalash"
+    )
+    await message.answer(text)
+
+
+@router.message(Command("taom_qoshish"))
+async def dish_add_start(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    await state.set_state(DishForm.waiting_name)
+    await message.answer("🍽 Taom nomini yozing:")
+
+
+@router.message(StateFilter(DishForm.waiting_name))
+async def dish_add_name(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Iltimos, taom nomini matn ko'rinishida yozing.")
+        return
+    await state.update_data(name=name)
+    await state.set_state(DishForm.waiting_price)
+    await message.answer("💰 Narxini yozing (faqat raqam, so'mda). Masalan: 35000")
+
+
+@router.message(StateFilter(DishForm.waiting_price))
+async def dish_add_price(message: Message, state: FSMContext):
+    price_text = (message.text or "").strip().replace(" ", "")
+    if not price_text.isdigit():
+        await message.answer("Iltimos, narxni faqat raqam bilan yozing. Masalan: 35000")
+        return
+    await state.update_data(price=int(price_text))
+    await state.set_state(DishForm.waiting_photo)
+    await message.answer(
+        "🖼 Taom rasmi uchun havola (URL) yuboring.\n"
+        "Agar rasm bo'lmasa, «-» deb yozing."
+    )
+
+
+@router.message(StateFilter(DishForm.waiting_photo))
+async def dish_add_photo(message: Message, state: FSMContext):
+    photo = (message.text or "").strip()
+    if photo == "-":
+        photo = "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=600"
+    await state.update_data(photo=photo)
+    await state.set_state(DishForm.waiting_desc)
+    await message.answer("📝 Qisqacha tavsif yozing (yoki «-»):")
+
+
+@router.message(StateFilter(DishForm.waiting_desc))
+async def dish_add_desc(message: Message, state: FSMContext):
+    desc = (message.text or "").strip()
+    if desc == "-":
+        desc = ""
+
+    data = await state.get_data()
+    dish = add_dish(name=data["name"], price=data["price"], image=data["photo"], description=desc)
+    await state.clear()
+
+    await message.answer(
+        f"✅ Qo'shildi!\n\n🍽 <b>{dish['nomi']}</b>\n💰 {dish['narx']:,} so'm".replace(",", " ")
+    )
+
+
+@router.message(Command("taom_royxati"))
+async def dish_list(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    items = load_daily_menu()
+    if not items:
+        await message.answer("Hozircha kunlik menyu bo'sh. /taom_qoshish orqali qo'shing.")
+        return
+    lines = ["📋 <b>Bugungi menyu:</b>\n"]
+    for i, it in enumerate(items, start=1):
+        lines.append(f"{i}. {it['nomi']} — {it['narx']:,} so'm".replace(",", " "))
+    lines.append("\nO'chirish uchun: /taom_ochirish <raqam>")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("taom_ochirish"))
+async def dish_remove(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Foydalanish: /taom_ochirish <raqam>\nRo'yxatni ko'rish uchun: /taom_royxati")
+        return
+    removed = remove_dish(int(parts[1]))
+    if removed:
+        await message.answer(f"🗑 O'chirildi: {removed['nomi']}")
+    else:
+        await message.answer("Bunday raqamli taom topilmadi.")
+
+
+@router.message(Command("menu_tozalash"))
+async def dish_clear(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    clear_menu()
+    await message.answer("🧹 Kunlik menyu tozalandi. Endi /taom_qoshish orqali yangi taomlarni qo'shing.")
+
+
 @router.message()
 async def fallback(message: Message):
     user = get_user(message.from_user.id)
@@ -381,6 +514,42 @@ async def fallback(message: Message):
     )
 
 
+async def menu_json_handler(request: web.Request) -> web.Response:
+    items = load_daily_menu()
+    data = {
+        "taomlar": items,
+        "yetkazib_berish": DELIVERY_FEE,
+        "bepul_yetkazib_berish_dan": FREE_DELIVERY_THRESHOLD,
+        "sana": datetime.now().strftime("%d.%m.%Y") + " kunlik menyu",
+    }
+    return web.json_response(
+        data,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+        },
+    )
+
+
+async def menu_json_options(request: web.Request) -> web.Response:
+    return web.Response(headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+    })
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/menu.json", menu_json_handler)
+    app.router.add_options("/menu.json", menu_json_options)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logging.info(f"Menu API http://0.0.0.0:{PORT}/menu.json manzilida ishga tushdi")
+
+
 async def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN topilmadi. .env faylini to'ldiring.")
@@ -392,6 +561,7 @@ async def main():
     # Polling bilan ishlash uchun uni majburan tozalaymiz.
     await bot.delete_webhook(drop_pending_updates=True)
 
+    await start_web_server()
     await dp.start_polling(bot)
 
 
