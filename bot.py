@@ -14,10 +14,14 @@ from datetime import datetime
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     KeyboardButton,
     WebAppInfo,
     InlineKeyboardMarkup,
@@ -38,6 +42,13 @@ MANAGER_PHONE = os.getenv("MANAGER_PHONE", "+998 90 000 00 00")
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
+
+
+class OrderForm(StatesGroup):
+    waiting_name = State()
+    waiting_phone = State()
+    waiting_address = State()
+    waiting_comment = State()
 
 # ------------------------------------------------------------------
 # Juda oddiy "baza" - foydalanuvchi tili va telefon raqamini json faylda saqlaydi.
@@ -136,7 +147,9 @@ REMINDER_RU = (
 # ------------------------------------------------------------------
 
 @router.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext = None):
+    if state:
+        await state.clear()
     await message.answer("Tilni tanlang / Выберите язык:", reply_markup=lang_keyboard())
 
 
@@ -181,7 +194,7 @@ async def change_lang(message: Message):
     await message.answer("Tilni tanlang / Выберите язык:", reply_markup=lang_keyboard())
 
 
-@router.message(F.content_type == ContentType.CONTACT)
+@router.message(F.content_type == ContentType.CONTACT, StateFilter(None))
 async def on_contact(message: Message):
     user = get_user(message.from_user.id)
     lang = user.get("lang") or "uz"
@@ -196,72 +209,151 @@ async def on_contact(message: Message):
 
 
 @router.message(F.web_app_data)
-async def on_webapp_order(message: Message):
-    """Mini-App (menyu) dan yuborilgan buyurtmani qabul qiladi."""
+async def on_webapp_order(message: Message, state: FSMContext):
+    """Mini-App (menyu)dan faqat savatchani qabul qiladi, keyin ism/telefon/manzilni
+    botning oddiy chat xabarlari orqali bir-bir so'raymiz — bu klaviatura bilan
+    bog'liq muammolarning oldini oladi."""
     user = get_user(message.from_user.id)
     lang = user.get("lang") or "uz"
 
     try:
-        order = json.loads(message.web_app_data.data)
+        cart = json.loads(message.web_app_data.data)
     except (ValueError, AttributeError):
         await message.answer("Xatolik: buyurtma o'qilmadi." if lang == "uz" else "Ошибка при чтении заказа.")
         return
 
-    items = order.get("items", [])
-    total = order.get("total", 0)
-    subtotal = order.get("subtotal", 0)
-    delivery = order.get("delivery", 0)
-    cust_name = order.get("name", "").strip()
-    cust_phone = order.get("phone", "").strip() or user.get("phone", "-")
-    cust_address = order.get("address", "").strip()
-    cust_comment = order.get("comment", "").strip()
+    if not cart.get("items"):
+        await message.answer("Savatcha bo'sh." if lang == "uz" else "Корзина пуста.")
+        return
+
+    await state.update_data(cart=cart)
+    await state.set_state(OrderForm.waiting_name)
+
+    text = "Ajoyib! Endi buyurtmani rasmiylashtiramiz.\n\n👤 Ismingizni yozing:" if lang == "uz" \
+        else "Отлично! Оформим заказ.\n\n👤 Напишите ваше имя:"
+    await message.answer(text, reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(StateFilter(OrderForm.waiting_name))
+async def order_get_name(message: Message, state: FSMContext):
+    user = get_user(message.from_user.id)
+    lang = user.get("lang") or "uz"
+    name = (message.text or "").strip()
+
+    if not name:
+        await message.answer("Iltimos, ismingizni matn ko'rinishida yozing." if lang == "uz" else "Пожалуйста, напишите имя текстом.")
+        return
+
+    await state.update_data(name=name)
+    await state.set_state(OrderForm.waiting_phone)
+
+    phone_kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(
+            text="📱 Raqamni yuborish" if lang == "uz" else "📱 Отправить номер",
+            request_contact=True,
+        )]],
+        resize_keyboard=True,
+    )
+    text = "📞 Telefon raqamingizni yuboring (tugmani bosing yoki yozib yuboring):" if lang == "uz" \
+        else "📞 Отправьте номер телефона (нажмите кнопку или напишите вручную):"
+    await message.answer(text, reply_markup=phone_kb)
+
+
+@router.message(StateFilter(OrderForm.waiting_phone))
+async def order_get_phone(message: Message, state: FSMContext):
+    user = get_user(message.from_user.id)
+    lang = user.get("lang") or "uz"
+
+    phone = message.contact.phone_number if message.contact else (message.text or "").strip()
+    if not phone:
+        await message.answer("Iltimos, telefon raqamingizni yuboring." if lang == "uz" else "Пожалуйста, отправьте номер телефона.")
+        return
+
+    set_user(message.from_user.id, phone=phone)
+    await state.update_data(phone=phone)
+    await state.set_state(OrderForm.waiting_address)
+
+    text = "📍 Yetkazib berish manzilini yozing (ko'cha, uy, mo'ljal):" if lang == "uz" \
+        else "📍 Напишите адрес доставки (улица, дом, ориентир):"
+    await message.answer(text, reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(StateFilter(OrderForm.waiting_address))
+async def order_get_address(message: Message, state: FSMContext):
+    user = get_user(message.from_user.id)
+    lang = user.get("lang") or "uz"
+    address = (message.text or "").strip()
+
+    if not address:
+        await message.answer("Iltimos, manzilni matn ko'rinishida yozing." if lang == "uz" else "Пожалуйста, напишите адрес текстом.")
+        return
+
+    await state.update_data(address=address)
+    await state.set_state(OrderForm.waiting_comment)
+
+    text = "📝 Izoh qoldirmoqchimisiz? Bo'lmasa, shunchaki «-» deb yozing." if lang == "uz" \
+        else "📝 Хотите оставить комментарий? Если нет — напишите «-»."
+    await message.answer(text)
+
+
+@router.message(StateFilter(OrderForm.waiting_comment))
+async def order_get_comment(message: Message, state: FSMContext):
+    user = get_user(message.from_user.id)
+    lang = user.get("lang") or "uz"
+    comment = (message.text or "").strip()
+    if comment == "-":
+        comment = ""
+
+    data = await state.get_data()
+    cart = data.get("cart", {})
+    cust_name = data.get("name", "")
+    cust_phone = data.get("phone", "")
+    cust_address = data.get("address", "")
+
+    items = cart.get("items", [])
+    subtotal = cart.get("subtotal", 0)
+    delivery = cart.get("delivery", 0)
+    total = cart.get("total", 0)
 
     order_no = datetime.now().strftime("%d%m-%H%M%S")
 
-    lines_uz = [f"🧾 <b>YANGI BUYURTMA №{order_no}</b>", ""]
-    lines_uz.append(f"👤 <b>Mijoz:</b> {cust_name or message.from_user.full_name}")
-    lines_uz.append(f"📞 <b>Telefon:</b> {cust_phone}")
-    lines_uz.append(f"📍 <b>Manzil:</b> {cust_address or 'kiritilmagan'}")
-    if cust_comment:
-        lines_uz.append(f"📝 <b>Izoh:</b> {cust_comment}")
-    lines_uz.append("")
-    lines_uz.append("🍽 <b>Buyurtma tarkibi:</b>")
+    lines = [f"🧾 <b>YANGI BUYURTMA №{order_no}</b>", ""]
+    lines.append(f"👤 <b>Mijoz:</b> {cust_name}")
+    lines.append(f"📞 <b>Telefon:</b> {cust_phone}")
+    lines.append(f"📍 <b>Manzil:</b> {cust_address}")
+    if comment:
+        lines.append(f"📝 <b>Izoh:</b> {comment}")
+    lines.append("")
+    lines.append("🍽 <b>Buyurtma tarkibi:</b>")
     for it in items:
-        line_total = it['price'] * it['qty']
-        lines_uz.append(f"  • {it['name']} — {it['qty']} dona × {it['price']:,} so'm = {line_total:,} so'm".replace(",", " "))
-    lines_uz.append("")
-    lines_uz.append(f"Mahsulotlar: {subtotal:,} so'm".replace(",", " "))
+        line_total = it["price"] * it["qty"]
+        lines.append(f"  • {it['name']} — {it['qty']} dona × {it['price']:,} so'm = {line_total:,} so'm".replace(",", " "))
+    lines.append("")
+    lines.append(f"Mahsulotlar: {subtotal:,} so'm".replace(",", " "))
     delivery_text = "BEPUL" if delivery == 0 else f"{delivery:,} so'm".replace(",", " ")
-    lines_uz.append(f"Yetkazib berish: {delivery_text}")
-    lines_uz.append(f"💰 <b>JAMI: {total:,} so'm</b>".replace(",", " "))
+    lines.append(f"Yetkazib berish: {delivery_text}")
+    lines.append(f"💰 <b>JAMI: {total:,} so'm</b>".replace(",", " "))
+    order_text = "\n".join(lines)
 
-    order_text = "\n".join(lines_uz)
-
-    # Sodiqlik dasturi: buyurtmalar sonini oshiramiz va mijozga ko'rsatamiz
+    # Sodiqlik dasturi
     new_order_count = user.get("orders", 0) + 1
-    set_user(message.from_user.id, orders=new_order_count, name=cust_name or user.get("name"))
+    set_user(message.from_user.id, orders=new_order_count, name=cust_name)
 
     remainder = new_order_count % LOYALTY_EVERY_N_ORDER_FREE
     is_reward_order = remainder == 0
     left_to_reward = 0 if is_reward_order else LOYALTY_EVERY_N_ORDER_FREE - remainder
 
-    # Foydalanuvchiga tasdiq
     if lang == "uz":
         confirm = f"✅ Buyurtmangiz qabul qilindi! Tez orada operatorimiz siz bilan bog'lanadi.\n\n📊 Bu — sizning <b>{new_order_count}-buyurtmangiz</b>!"
-        if is_reward_order:
-            confirm += "\n🎁 Tabriklaymiz! Siz BEPUL kombo yutdingiz — keyingi buyurtmangizda operatorga ayting!"
-        else:
-            confirm += f"\n🎁 Yana <b>{left_to_reward} ta</b> buyurtmadan so'ng — BEPUL kombo sizniki!"
+        confirm += "\n🎁 Tabriklaymiz! Siz BEPUL kombo yutdingiz — keyingi buyurtmangizda operatorga ayting!" if is_reward_order \
+            else f"\n🎁 Yana <b>{left_to_reward} ta</b> buyurtmadan so'ng — BEPUL kombo sizniki!"
     else:
         confirm = f"✅ Ваш заказ принят! Наш оператор скоро свяжется с вами.\n\n📊 Это — ваш <b>{new_order_count}-й заказ</b>!"
-        if is_reward_order:
-            confirm += "\n🎁 Поздравляем! Вы выиграли БЕСПЛАТНОЕ комбо — сообщите об этом оператору в следующем заказе!"
-        else:
-            confirm += f"\n🎁 Ещё <b>{left_to_reward}</b> заказ(-ов) — и БЕСПЛАТНОЕ комбо ваше!"
+        confirm += "\n🎁 Поздравляем! Вы выиграли БЕСПЛАТНОЕ комбо — сообщите об этом оператору в следующем заказе!" if is_reward_order \
+            else f"\n🎁 Ещё <b>{left_to_reward}</b> заказ(-ов) — и БЕСПЛАТНОЕ комбо ваше!"
 
-    await message.answer(confirm)
+    await message.answer(confirm, reply_markup=main_menu_keyboard(lang))
 
-    # Admin/oshxonaga yuborish
     if ADMIN_CHAT_ID:
         try:
             admin_text = order_text + f"\n\n📊 Mijozning buyurtmalar soni: {new_order_count}"
@@ -270,6 +362,8 @@ async def on_webapp_order(message: Message):
             await message.bot.send_message(ADMIN_CHAT_ID, admin_text)
         except Exception as e:
             logging.warning(f"Adminga yuborilmadi: {e}")
+
+    await state.clear()
 
 
 @router.message()
@@ -291,7 +385,7 @@ async def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN topilmadi. .env faylini to'ldiring.")
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
     # Boshqa tizim (masalan LeadTeh) shu tokenga webhook o'rnatgan bo'lishi mumkin.
