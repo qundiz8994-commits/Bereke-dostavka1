@@ -26,7 +26,7 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
-from menu_data import MENU, DELIVERY_FEE, FREE_DELIVERY_THRESHOLD
+from menu_data import MENU, DELIVERY_FEE, FREE_DELIVERY_THRESHOLD, LOYALTY_EVERY_N_ORDER_FREE
 
 load_dotenv()
 
@@ -88,10 +88,12 @@ def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
     menu_label = "🍽 Menyuni ochish" if lang == "uz" else "🍽 Открыть меню"
     phone_label = "📱 Raqamni ulashish" if lang == "uz" else "📱 Поделиться номером"
     lang_label = "🌐 Til / Язык"
+    points_label = "🎁 Mening ballarim" if lang == "uz" else "🎁 Мои баллы"
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=menu_label, web_app=WebAppInfo(url=WEBAPP_URL))],
             [KeyboardButton(text=phone_label, request_contact=True)],
+            [KeyboardButton(text=points_label)],
             [KeyboardButton(text=lang_label)],
         ],
         resize_keyboard=True,
@@ -159,6 +161,21 @@ async def get_chat_id(message: Message):
     await message.answer(f"Chat ID: <code>{message.chat.id}</code>")
 
 
+@router.message(F.text.in_(["🎁 Mening ballarim", "🎁 Мои баллы"]))
+async def my_points(message: Message):
+    user = get_user(message.from_user.id)
+    lang = user.get("lang") or "uz"
+    orders = user.get("orders", 0)
+    remainder = orders % LOYALTY_EVERY_N_ORDER_FREE
+    left = LOYALTY_EVERY_N_ORDER_FREE - remainder if remainder != 0 else LOYALTY_EVERY_N_ORDER_FREE
+
+    if lang == "uz":
+        text = f"📊 Sizning jami buyurtmalaringiz: <b>{orders} ta</b>\n🎁 Yana <b>{left} ta</b> buyurtmadan so'ng — BEPUL kombo sizniki!"
+    else:
+        text = f"📊 Всего ваших заказов: <b>{orders}</b>\n🎁 Ещё <b>{left}</b> заказ(-ов) — и БЕСПЛАТНОЕ комбо ваше!"
+    await message.answer(text)
+
+
 @router.message(F.text.in_(["🌐 Til / Язык"]))
 async def change_lang(message: Message):
     await message.answer("Tilni tanlang / Выберите язык:", reply_markup=lang_keyboard())
@@ -220,20 +237,39 @@ async def on_webapp_order(message: Message):
 
     order_text = "\n".join(lines_uz)
 
+    # Sodiqlik dasturi: buyurtmalar sonini oshiramiz va mijozga ko'rsatamiz
+    new_order_count = user.get("orders", 0) + 1
+    set_user(message.from_user.id, orders=new_order_count, name=cust_name or user.get("name"))
+
+    remainder = new_order_count % LOYALTY_EVERY_N_ORDER_FREE
+    is_reward_order = remainder == 0
+    left_to_reward = 0 if is_reward_order else LOYALTY_EVERY_N_ORDER_FREE - remainder
+
     # Foydalanuvchiga tasdiq
-    confirm_uz = "✅ Buyurtmangiz qabul qilindi! Tez orada operatorimiz siz bilan bog'lanadi."
-    confirm_ru = "✅ Ваш заказ принят! Наш оператор скоро свяжется с вами."
-    await message.answer(confirm_uz if lang == "uz" else confirm_ru)
+    if lang == "uz":
+        confirm = f"✅ Buyurtmangiz qabul qilindi! Tez orada operatorimiz siz bilan bog'lanadi.\n\n📊 Bu — sizning <b>{new_order_count}-buyurtmangiz</b>!"
+        if is_reward_order:
+            confirm += "\n🎁 Tabriklaymiz! Siz BEPUL kombo yutdingiz — keyingi buyurtmangizda operatorga ayting!"
+        else:
+            confirm += f"\n🎁 Yana <b>{left_to_reward} ta</b> buyurtmadan so'ng — BEPUL kombo sizniki!"
+    else:
+        confirm = f"✅ Ваш заказ принят! Наш оператор скоро свяжется с вами.\n\n📊 Это — ваш <b>{new_order_count}-й заказ</b>!"
+        if is_reward_order:
+            confirm += "\n🎁 Поздравляем! Вы выиграли БЕСПЛАТНОЕ комбо — сообщите об этом оператору в следующем заказе!"
+        else:
+            confirm += f"\n🎁 Ещё <b>{left_to_reward}</b> заказ(-ов) — и БЕСПЛАТНОЕ комбо ваше!"
+
+    await message.answer(confirm)
 
     # Admin/oshxonaga yuborish
     if ADMIN_CHAT_ID:
         try:
-            await message.bot.send_message(ADMIN_CHAT_ID, order_text)
+            admin_text = order_text + f"\n\n📊 Mijozning buyurtmalar soni: {new_order_count}"
+            if is_reward_order:
+                admin_text += "\n🎁 DIQQAT: mijoz sodiqlik mukofotiga (BEPUL kombo) haqli!"
+            await message.bot.send_message(ADMIN_CHAT_ID, admin_text)
         except Exception as e:
             logging.warning(f"Adminga yuborilmadi: {e}")
-
-    # Buyurtmalar sonini oshirish (sodiqlik dasturi uchun)
-    set_user(message.from_user.id, orders=user.get("orders", 0) + 1)
 
 
 @router.message()
